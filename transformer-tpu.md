@@ -43,7 +43,7 @@ In a transformer, we have 2 types of operations: matmuls, and elementwise ops li
 
 The memory hierarchy of our TPU is simple. We are using a Cmod A7 board, which includes an Artix-7 FPGA chip along with an external asynchronous SRAM chip (8 bit read, 10 ns access time). We use the SRAM chip to model our accelerator's external memory (HBM/DDR in a real accelerator), and the Artix-7's BRAM to act as an on-chip cache (scratchpad memory). 
 
-There are 3 main units: MXU, VPU, and DMA. The MXU (matrix multiply unit) handles the matrix multiplications, VPU (vector processing unit) handles vector operations such as activations and addition. Both units read from the scratchpad memory and write their results back to scratchpad. The DMA (direct memory access) handles transfers between scratchpad and external memory. Each unit is controlled by a softcore PicoRV32 processor, which we can write C firmware to dispatch instructions to each unit through AXI-based MMIO.
+There are 3 main units: MXU, VPU, and DMA. The MXU (matrix multiply unit) handles the matrix multiplications, VPU (vector processing unit) handles vector operations such as activations and addition. Both units read from the scratchpad memory and write their results back to scratchpad. The DMA (direct memory access) handles transfers between scratchpad and external memory. Each unit is controlled by a softcore PicoRV32 processor, for which we can write C firmware to dispatch instructions to each unit through AXI-based MMIO.
 
 ![TPU architecture](/writeup/tpu-chip.png)
 
@@ -72,13 +72,13 @@ For matmuls, we use an output-stationary 8x8 systolic array; each PE keeps its p
 
 As a result, every clock, the systolic array reads $$32$$ bits (8 int4 values) for matrix A and $$32$$ bits for matrix B. This is where the scratchpad architecture comes in handy: as long as A and B are in different memory regions, they can be read at the same time, without interfering with ongoing DMA operations. With all $$64$$ PEs accumulating one product each clock, our MXU does $$64$$ multiply-accumulates per clock, which is the compute number we will use for the rest of this article.
 
-The VPU is pretty simple. Its inputs are the base address of a vector and the length of the operation. It repeatedly loads chunks of the vector from scratchpad, operates on them (add, relu, etc), and writes them back, until the operation is completed.
+The VPU is pretty simple. Its inputs are the base address of a vector and the length of the operation. It repeatedly loads chunks of the vector from scratchpad, operates on them (add, relu, etc.), and writes them back, until the operation is completed.
 
 ### Design Choices & Other Notes
 
-We use PicoRV32 so that we can easily write firmware for different architectures. Not only does this allow for unit testing beyond just inference & different architectures, it allows us to easily experiment with optimizations later on without having to change the dataflow in hardware.
+We use PicoRV32 so that we can easily write firmware for different architectures. Not only does this allow for unit testing beyond just inference and different architectures, it allows us to easily experiment with optimizations later on without having to change the dataflow in hardware.
 
-CPU issue overhead was also a concern when designing the architecture. When the CPU dispatches instructions, they enter a command queue for each unit, which are then executed asynchronously from the CPU execution order. For synchronization, the CPU can also poll each instruction queue's state. Furthermore, to minimize the effect of execution latency, the TPU operations are intentionally complex, allowing for instructions to span across large address ranges without needing more CPU executes.
+CPU issue overhead was also a concern when designing the architecture. When the CPU dispatches instructions, they enter a command queue for each unit, which are then executed asynchronously from the CPU execution order. For synchronization, the CPU can also poll each instruction queue's state. Furthermore, to minimize the effect of execution latency, the TPU operations are intentionally complex, allowing for instructions to span across large address ranges without needing more CPU dispatch calls.
 
 ## Firmware & Kernels
 
@@ -257,7 +257,7 @@ And let's calculate the cost of the attention score matrix, where the $$4$$ is o
 
 What if we could change our attention so that it doesn't write the attention score matrix $$P$$ at all? FlashAttention does exactly that. Since our transformer doesn't include softmax, we'll be modifying the original FlashAttention a bit, but the main idea stays the same.
 
-The main idea is to break down our $$Q,K,V$$ tensors into tiles of size $$[B,d_h]$$ for each head, so that the tiles fit in scratchpad. The outer loop goes through the $$Q$$ tiles, and the inner loop goes through $$K$$ tiles. In each loop, a $$[B, B]$$ tile of the attention scores is calculated, and then is multiplied by the corresponding $$V$$ tile. The result is accumulated over the outer loop. Here's the pseudocode for our FlashAttention algorithm:
+The main idea is to break down our $$Q,K,V$$ tensors into tiles of size $$[B,d_h]$$ for each head, so that the tiles fit in scratchpad. The outer loop goes through the $$Q$$ tiles, and the inner loop goes through $$K$$ tiles. In each loop, a $$[B, B]$$ tile of the attention scores is calculated, and then is multiplied by the corresponding $$V$$ tile. The result is accumulated over the inner loop. Here's the pseudocode for our FlashAttention algorithm:
 
 ```
 input: Q, K, V, tokens (T), head dim (d_h)
@@ -297,10 +297,10 @@ producer stalled on a full queue              0    0.0%
 two or more units busy                   111918    4.4%
 ```
 
-That's a 15% speedup over the base attention. Most notably, our DMA usage went down a lot! It's nearly 30% less than before. And as our context window grows bigger, the speedup will only increase. This optimization is also what allowed models to increase from just a few thousand to 1M+ context length, as the very large attention score matrix no longer needs to be stored in external memory.
+That's a 15% speedup over the base attention. Most notably, our DMA usage went down a lot! It's about 32% less than before. And as our context window grows bigger, the speedup will only increase. This optimization is also what allowed models to increase from just a few thousand to 1M+ context length, as the very large attention score matrix no longer needs to be stored in external memory.
 
 ## Conclusion
 
 This concludes my journey in creating a TPU. Looking back at this project, it's actually pretty amazing: we were able to replicate FlashAttention, common model optimization techniques, and even calculate transformer performance, all on a finger-sized FPGA board for less than $100! My optimizations definitely aren't perfect, though; there's still a lot of room to increase compute/memory overlapping, and much more.
 
-One thing I didn't do in this project that could be interesting: multi-device inference. Since I only had access to one Cmod board, I couldn't experiment with implementing operations like AllReduce or running sharded inference. There's a lot of interesting results that come out of this discussed in the Scaling Book, but this will have to be left as something to do later.
+One thing I didn't do in this project that could be interesting: multi-device inference. Since I only had access to one Cmod board, I couldn't experiment with implementing operations like AllReduce or running sharded inference. There are a lot of interesting results that come out of this discussed in the Scaling Book, but this will have to be left as something to do later.

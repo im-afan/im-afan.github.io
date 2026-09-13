@@ -5,7 +5,7 @@ title: Andrew Fan
 
 # Andrew Fan
 
-EE undergrad at UCLA. I'm especially intersted in the intersection of computer architecture, ML systems, and hardware-software co-design.
+EE undergrad at UCLA. I'm especially interested in the intersection of computer architecture, ML systems, and hardware-software co-design.
 
 [email](mailto:andrewkongfan@gmail.com) · [github](https://github.com/im-afan)
 
