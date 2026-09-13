@@ -10,6 +10,8 @@ permalink: /transformer-tpu/
 
 This was a summer project I made to learn the basics of ML performance optimization and hardware-software co-design. The overall goal of this project is to run a small transformer on my Cmod A7 FPGA board. Then, I want to derive some of the common results you'll find in LLM scaling (limited to a single device for now), and optimize my kernels to see how much performance I can squeeze out of my hardware design. I'm assuming you have basic knowledge on how transformer inference works (prefill, decode), but not the hardware side of things. All the code can be found in the project's [github repo](https://github.com/im-afan/transformer-tpu-int4).
 
+Much of the analysis I do (including the next section), along with the TPU architecture itself, is heavily inspired by the [Scaling Book](https://jax-ml.github.io/scaling-book/). If you find this article interesting, you might enjoy reading the scaling book!
+
 ## Background
 
 ### What determines how fast our model is?
@@ -18,20 +20,20 @@ Before we get into hardware, we need to ask a seemingly obvious question: what m
 
 On the other hand, we have communication. In single-device inference, this usually refers to the comms between the memory (HBM, DDR) and the accelerator's cache. In distributed inference, the comms between devices must also be considered. Similarly, if we know the memory bandwidth of our HBM or DDR, we can calculate our comms time as $$T_{\text{comms}} = \frac{\text{Communication Bytes}}{\text{Memory Bytes/sec}}$$
 
-In most hardware, we assume that comms and compute run at the same time, so optimally, they are completely overlapped. So, our lower bound on the runtime of an algorithm is $$\max(T_{\text{comms}}, T_{\text{compute}})$$. 
+In most hardware, we assume that comms and compute run at the same time, so optimally, they are completely overlapped. So, our lower bound on the runtime of an algorithm is $$\max(T_{\text{comms}}, T_{\text{compute}})$$. Generally speaking, our goal in designing both hardware and kernels is to analyze the bottleneck between these two and optimize it. For example, it wouldn't make sense to try to speed up a memory-bound algorithm by trying to use more arithmetic units!
 
 ### Matmuls
 
-Matmuls have a property regarding compute and comms that makes them so special for ML. First, let us consider an $$N\times N\times N$$ matmul, in int8: $$A[N, N] \cdot B[N, N] = C[N, N]$$. In the best case, we have to load $$2N^2$$ bytes to our compute, then write back $$N^2$$ bytes to memory, which is a total of $$3N^2$$. For compute, we have to perform $$N^3$$ int8 multiplications. So the total arithmetic intensity of the algorithm is on the order of N, meaning it is more compute-demanding the larger our matmul gets. This is partly why matmuls are so essential to ML workloads: it is very easy to scale up our models by just throwing more compute at it to achieve larger matmuls.  
+Matmuls have a special property regarding compute and comms that makes them the backbone of ML. First, let us consider an $$N\times N\times N$$ matmul, in int8 (our design uses int4, but int8 keeps the byte counts clean): $$A[N, N] \cdot B[N, N] = C[N, N]$$. In the best case, we have to load $$2N^2$$ bytes to our compute, then write back $$N^2$$ bytes to memory, which is a total of $$3N^2$$. For compute, we have to perform $$N^3$$ int8 multiplications. So the total arithmetic intensity of the algorithm is on the order of N, meaning it is more compute-demanding the larger our matmul gets. This is partly why matmuls are so essential to ML workloads: it is very easy to scale up our models by just throwing more compute at it to achieve larger matmuls. 
 
 
 ## Model Architecture / Goal
 
 The overall goal is to run a transformer model on our design, while not making it completely fixed to a single architecture. We want to be able to write code to change the model architecture/dimensions, tweak our matmuls to be more efficient, or run unit tests to benchmark single layers or matmuls. This means that having fixed control flow set in hardware is not acceptable.
 
-We will train and inference our model on predicting the next token in an addition sequence with a maximum of 31 digits per input (64 token prefill and 64 token decode overall), which is a pretty simple but nontrivial task. 
+We will train our model and run inference on predicting the next token in an addition sequence with a maximum of 31 digits per input (64 token prefill and 64 token decode overall), which is a pretty simple but nontrivial task. 
 
-For benchmarking, we use a standard Transformer architecture, with embedding dim $$d=128$$, ffn dim $$d_{ff}=512$$, 4 QKV heads, and 4 layers. However, we greatly simplify some operations to allow for ease of implementation. First, we replace gelu with relu activation. Softmax in attention is also replaced with a simple ReLU, which has a big effect on training but is fine for our task. LayerNorm is replaced with a tanh normalization. Finally, we train with no bias in the ffn. While these are pretty major simplifications, the overall architecture stays the same, and the original goal of analyzing transformer inference performance can still be achieved.
+For benchmarking, we use a standard Transformer architecture, with embedding dim $$d=128$$, ffn dim $$d_{ff}=512$$, 4 QKV heads, and 4 layers. However, we greatly simplify some operations to allow for ease of implementation. First, we replace gelu with relu activation. Softmax in attention is also replaced with a ReLU, which makes training much harder to converge but is fine for our task. LayerNorm is replaced with a hardtanh normalization. Finally, we train with no bias in the ffn. While these are pretty major simplifications, the overall architecture stays the same, and the original goal of analyzing transformer inference performance can still be achieved.
 
 ## Hardware
 
@@ -39,19 +41,19 @@ For benchmarking, we use a standard Transformer architecture, with embedding dim
 
 In a transformer, we have 2 types of operations: matmuls, and elementwise ops like tensor addition and ReLU. The purpose of an accelerator is to load tensors from memory, do those operations, and write back the results. To make the most of our FPGA resources and memory, we choose to quantize activations and weights to int4. 
 
-The memory heirarchy of our TPU is simple. We are using a Cmod A7 board, which includes an Artix-7 FPGA chip along with an external asynchronous SRAM chip (8 bit read, 10 ns access time). We use the SRAM chip to model our accelerator's external memory (HBM/DDR in a real accelerator), and the Artix-7's BRAM to act as an on-chip cache (scratchpad memory). 
+The memory hierarchy of our TPU is simple. We are using a Cmod A7 board, which includes an Artix-7 FPGA chip along with an external asynchronous SRAM chip (8 bit read, 10 ns access time). We use the SRAM chip to model our accelerator's external memory (HBM/DDR in a real accelerator), and the Artix-7's BRAM to act as an on-chip cache (scratchpad memory). 
 
-There are 3 main units: MXU, VPU, and DMA. The MXU (matrix mutliply unit) handles the matrix multiplications, VPU (vector processing unit) handles vector operations such as activations and addition. Both units read from the scratchpad memory and write their results back to scratchpad. The DMA (direct memory access) handles transfers between scratchpad and external memory. Each unit is controlled by a softcore PicoRV32 processor, which we can write C firmware to dispatch instructions to each unit through AXI-based MMIO.
+There are 3 main units: MXU, VPU, and DMA. The MXU (matrix multiply unit) handles the matrix multiplications, VPU (vector processing unit) handles vector operations such as activations and addition. Both units read from the scratchpad memory and write their results back to scratchpad. The DMA (direct memory access) handles transfers between scratchpad and external memory. Each unit is controlled by a softcore PicoRV32 processor, which we can write C firmware to dispatch instructions to each unit through AXI-based MMIO.
 
 ![TPU architecture](/writeup/tpu-chip.png)
 
-*Abstract layout of a real TPU TensorCore, which ours follows the shape of. Source: [How To Scale Your Model](https://jax-ml.github.io/scaling-book/tpus/)*
+*Abstract layout of a real TPU TensorCore, whose shape ours follows. Source: [How To Scale Your Model](https://jax-ml.github.io/scaling-book/tpus/)*
 
 There are a few differences in our design. Vmem is our scratchpad, and HBM is our external SRAM chip. The scalar unit is just the PicoRV32 core. We also have a DMA unit, which is what actually moves data between the SRAM and the scratchpad.
 
 ### Memory 
 
-Our scratchpad memory is synthesized as simple dual-port BRAM, with 2 independent ports: read and write. Since it can be synthesized to basically an arbitrary bus width for our usage (1 x 32K bits to 72 x 512 bits), we don't need the blocks to be traditional banks by `address % bus width`. Instead, we can use a single block to represent a contiguous region of our scratchpad memory. This basically allows us to have as many ports accessing scratchpad as we want, with the limitation that 2 ports don't access the same region; this will be very useful in the design later.
+Our scratchpad memory is synthesized as simple dual-port BRAM, with 2 independent ports: read and write. Since it can be synthesized to basically an arbitrary bus width for our usage (1 x 32K bits to 72 x 512 bits), we don't need the blocks to be traditional banks indexed by `address % bus_width`. Instead, we can use a single block to represent a contiguous region of our scratchpad memory. This basically allows us to have as many ports accessing scratchpad as we want, with the limitation that 2 ports don't access the same region; this will be very useful in the design later.
 
 ![Simple dual-port BRAM](/writeup/bram_sdp.png)
 
@@ -62,13 +64,13 @@ Our DMA is very simple. Running at the Cmod A7's standard 12 MHz clock, the 10 n
 
 ### MXU & VPU
 
-For matmuls, we use an output-stationary 8x8 systolic array; each PE keeps its partial sum, while moving its input values to the next PE to its right and below it. This allows us to perform an arbitrary 8xNx8 ($$A[8,N] \cdot B[N,8])$$) matmul, as long as A and B fit in scratchpad. By default, all tensors are stored row-major in both external memory and scratchpad. Since our design has no fast way to transpose a matrix, we instead use a trick in the MXU to perform transposed matmuls such as $$QK^T$$ in attention. By default, A and B are fed into the systolic array like this:
+For matmuls, we use an output-stationary 8x8 systolic array; each PE keeps its partial sum, while moving its input values to the next PE to its right and below it. This allows us to perform an arbitrary 8xNx8 ($$A[8,N] \cdot B[N,8]$$) matmul, as long as A and B fit in scratchpad. By default, all tensors are stored row-major in both external memory and scratchpad. Since our design has no fast way to transpose a matrix, we instead use a trick in the MXU to perform transposed matmuls such as $$QK^T$$ in attention. By default, A and B are fed into the systolic array like this:
 
 ![MXU dataflow](/writeup/mxu.png)
 
-*2x2 version of the MXU; the real one is 8x8. Each PE stores one output element $$c_{ij}$$. Left, no transpose: row $$i$$ of A (blue) is loaded into that row's register as one contiguous chunk and shifts out one element per clock. A whole B row arrives at once, and registers skew the incoming data. Middle, transposed: B is stored $$[N, K]$$ instead, so a column's elements are contiguous and B is fed the same way as A. This makes it so that transposed matrices never need to be re-arranged in memory; the MXU just reads them differently.* 
+*2x2 version of the MXU; the real one is 8x8. Each PE stores one output element $$c_{ij}$$. Left, no transpose: row $$i$$ of A (blue) is loaded into that row's register as one contiguous chunk and shifts out one element per clock. A whole B row arrives at once, and registers skew the incoming data. Right, transposed: B is stored $$[N, K]$$ instead, so a column's elements are contiguous and B is fed the same way as A. This makes it so that transposed matrices never need to be re-arranged in memory; the MXU just reads them differently.* 
 
-As a result, every clock, the systolic array reads $$32$$ bits (8 int4 values) for matrix A and $$32$$ bits for matrix B. This is where the scratchpad architecture comes in handy: as long as A and B are in different memory regions, they can be read at the same time, without interfering with ongoing DMA operations.
+As a result, every clock, the systolic array reads $$32$$ bits (8 int4 values) for matrix A and $$32$$ bits for matrix B. This is where the scratchpad architecture comes in handy: as long as A and B are in different memory regions, they can be read at the same time, without interfering with ongoing DMA operations. With all $$64$$ PEs accumulating one product each clock, our MXU does $$64$$ multiply-accumulates per clock, which is the compute number we will use for the rest of this article.
 
 The VPU is pretty simple. Its inputs are the base address of a vector and the length of the operation. It repeatedly loads chunks of the vector from scratchpad, operates on them (add, relu, etc), and writes them back, until the operation is completed.
 
@@ -76,7 +78,7 @@ The VPU is pretty simple. Its inputs are the base address of a vector and the le
 
 We use PicoRV32 so that we can easily write firmware for different architectures. Not only does this allow for unit testing beyond just inference & different architectures, it allows us to easily experiment with optimizations later on without having to change the dataflow in hardware.
 
-CPU issue overhead was also a concern when designing the architecture. When the CPU dispatches instructions, they enter a command queue for each unit, which are then executed asynchronous of the CPU execution order. For synchronization, the CPU can also poll each instruction queue's state. Furthermore, to minimize the effect of execution latency, the TPU operations are intentionally complex, allowing for instructions to span across large address ranges without needing more CPU executes.
+CPU issue overhead was also a concern when designing the architecture. When the CPU dispatches instructions, they enter a command queue for each unit, which are then executed asynchronously from the CPU execution order. For synchronization, the CPU can also poll each instruction queue's state. Furthermore, to minimize the effect of execution latency, the TPU operations are intentionally complex, allowing for instructions to span across large address ranges without needing more CPU executes.
 
 ## Firmware & Kernels
 
@@ -88,7 +90,7 @@ We start by implementing the basic instruction dispatch to the TPU. After that, 
 
 ### Optimizing A Matmul
 
-We are lucky enough to have a relatively big scratchpad (64 KB) compared to our external SRAM (512 KB), which is a 1:8 ratio. With d=128, d_ff=512, and T=64 during prefill, our largest matmul, in the FFN, requires about $$(128 * 512 + 64 * 128 + 64 * 512) / 2 = 53,248$$ bytes (52 KB), which can fit entirely in our scratchpad! This means that we can basically always achieve the theoretical $$NM + MK + NK$$ byte loads for a matmul, since we don't need to load the same chunk of a matrix twice when tiling. 
+We are lucky enough to have a relatively big scratchpad (64 KB) compared to our external SRAM (512 KB), which is a 1:8 ratio. With d=128, d_ff=512, and T=64 during prefill, our largest matmul, in the FFN, requires about $$(128 * 512 + 64 * 128 + 64 * 512) / 2 = 53,248$$ bytes (52 KB), which can fit entirely in our scratchpad! This means that for the matmuls in our benchmark, we can basically always achieve the theoretical $$NM + MK + NK$$ byte loads, since we don't need to load the same chunk of a matrix twice when tiling. 
 
 We implement matmul as a tiled matmul over $$8\times 8$$ tiles in the output matrix. Here's the pseudocode for this kernel: 
 
@@ -111,13 +113,13 @@ for i from 0 to M, with step 8*S:
 
 And if we instead want $$C = AB^T$$, we instead load `B[j:j+8][:]` to B_tile, and dispatch a transpose flag when calling the mxu.
 
-This algorithm uses less scratchpad memory than the upper bound we just calculated, and it also supports matmuls that don't fully fit in the scratchpad by autofitting the S variable. However, that would cause inefficiency due to having to load each element of B more than once.
+This algorithm uses less scratchpad memory than the upper bound we just calculated, and it also supports matmuls that don't fully fit in the scratchpad by autofitting the S variable. However, in that case we lose the property above, since each element of B would have to be loaded more than once.
 
-But this still isn't optimal! Remember that, optimally, our runtime is the max of the MXU and DMA time. We need a way to overlap our DMA accesses with the MXU decently. To do this, we instead allocate 2 regions for `B_tile` in scratchpad, allowing us to double-buffer our DMA loads. So as our MXU is active in the `k` loop, we are loading the next chunk of B simultaneously, to the inactive B buffer. We will discuss the results of each optimization we do in detail later.
+But this still isn't optimal! Remember that, optimally, our runtime is the max of the MXU and DMA time. We need a way to overlap our DMA accesses with the MXU. To do this, we instead allocate 2 regions for `B_tile` in scratchpad, allowing us to double-buffer our DMA loads. So as our MXU is active in the `k` loop, we are loading the next chunk of B simultaneously, to the inactive B buffer. We will discuss the results of each optimization we do in detail later.
 
 ### Optimizing Full Inference
 
-Aside from our matmul, we also implement elementwise operations. This is pretty simple; just copy the tensor(s) to scratchpad, dispatch the VPU on the addresses, and write back to DRAM. If the tensor doesn't fit entirely, load chunks of it into scratchpad and do it multiple times. 
+Aside from our matmul, we also implement elementwise operations. This is pretty simple; just copy the tensor(s) to scratchpad, dispatch the VPU on the addresses, and write back to external memory. If the tensor doesn't fit entirely, load chunks of it into scratchpad and do it multiple times. 
 
 We are now ready to implement a full inference kernel! Using our model architecture, a full prefill, for a single layer, looks like this: 
 
@@ -196,9 +198,9 @@ no unit busy (issue overhead)            383315   11.4%
 producer stalled on a full queue              0    0.0%
 two or more units busy                   367473   10.9%
 ```
-We see that the double buffering helps a lot! it improves our runtime by about 18% in full inference and 9% in prefill. Obviously, we haven't achieved full overlap between compute and comms, but this is probably about as good as I could achieve without designing out-of-order execution in hardware.
+We see that the double buffering helps a lot! It improves our runtime by about 18% in full inference and 9% in prefill. Obviously, we haven't achieved full overlap between compute and comms, but this is probably about as good as I could achieve without designing out-of-order execution in hardware.
 
-But the main observation comes from comparing the prefill and decode. As you can see, decode takes up more than 90% of the actual LLM inference time, which is pretty similar to actual workloads. Furthermore, we see that while prefill's DMA clocks is only about 80% more than MXU (this is actually pretty bad, we will talk more about this later), it is about 3-4x higher in decode. You've probably heard that prefill is compute bound, while decode is memory-bound. We've just shown that here! 
+But the main observation comes from comparing the prefill and decode. We never benchmark decode on its own, but subtracting the prefill run from the full run gives about $$54$$M of the $$57.7$$M clocks, so decode takes up more than 90% of the actual LLM inference time, which is pretty similar to actual workloads. Furthermore, we see that while prefill's DMA clocks are only about 80% more than MXU (this is actually pretty bad, we will talk more about this later), it is about 3-4x higher in decode. You've probably heard that prefill is compute bound, while decode is memory-bound. We've just shown that here! 
 
 To see why in more detail, let's do some quick math. Let's approximate our transformer as only the FFN blocks, for each layer. For each layer, we load our weight matrices of size $$[d, 4d]$$ and $$[4d, d]$$, and our activations $$[S,d], [S,4d]$$ which are both read and written. On the compute side, we do 2 matmuls: $$[S, d]\times [d, 4d]$$ and $$[S, 4d]\times [4d, d]$$. So in total, we are loading $$8d^2/2 + 5Sd/2$$ bytes, writing back $$5Sd/2$$ bytes (recalling that our external memory is 1 clock/byte read and 2 clock/byte write, $$4d^2 + \frac{15Sd}{2}$$ clocks total), and doing $$8Sd^2$$ operations. 
 
@@ -229,7 +231,7 @@ Wow! That's a 24% speedup over the double-buffered code, and a 31% speedup over 
 
 #### FlashAttention (kinda)
 
-The current benchmark is a bit weird. We have an embedding dim of $$128$$, but our prefill size is quite small; only $$64$$ tokens. In real models like DeepSeek-v4-pro, the ratio is very different: while it has a $$7168$$ embedding dim, it easily support up to 100k+ tokens! So for this next benchmark, we will be increasing the prefill size to $$256$$. Since our memory is limited, we will be reducing our model to just 1 layer.
+The current benchmark is a bit weird. We have an embedding dim of $$128$$, but our prefill size is quite small; only $$64$$ tokens. In real models like DeepSeek-V3, the ratio is very different: while it has a $$7168$$ embedding dim, it easily supports up to 100k+ tokens! So for this next benchmark, we will be increasing the prefill size to $$256$$. Since our memory is limited, we will be reducing our model to just 1 layer.
 
 But we're not done yet. To see what we should optimize, we need a full picture of every single tensor our inference loads.
 
@@ -239,7 +241,7 @@ In attention, we calculate our attention scores $$P$$ of size $$[T,T]$$. We then
 
 For weights, our $$W_{Q/K/V/O}$$ weights are each $$[d, d]$$, so $$4d^2 / 2$$ bytes. We also have the FFN weights which are $$[d, 4d]$$ and $$[4d, d]$$, so $$8d^2 / 2$$ bytes. In total, we are loading $$6d^2$$ bytes. We don't have to write them back, so this is $$6d^2$$ DMA clocks.
 
-Summing it all up: $$1.5\cdot 10Td + 1.5T^2h + 6d^2$$ DMA clocks. That $$T^2$$ term is really scary; as our context window grows larger, that will be the majority of the cost. Here's a prefill benchmark on our new architecture: 
+Summing it all up: $$1.5\cdot 10Td + 1.5T^2h + 6d^2$$ DMA clocks. That $$T^2$$ term is really scary; as our context window grows larger, that will be the majority of the cost. Here's a prefill benchmark on our new architecture ($$d=128$$, $$T=256$$, 1 layer, fused matmuls, standard attention): 
 
 ```
 run                                     2995837 clocks  249.653 ms @ 12 MHz
@@ -251,9 +253,9 @@ producer stalled on a full queue              0    0.0%
 two or more units busy                   130068    4.3%
 ```
 
-And let's calculate the cost of the attention score matrix. $$1.5\cdot 256^2\cdot 4$$ = 393,216. $$40\%$$ of the total comms! And if we reduce our model even more to $$d=64$$ with prefill size $$512$$, that grows to nearly $$75\%$$.
+And let's calculate the cost of the attention score matrix, where the $$4$$ is our head count $$h$$. $$1.5\cdot 256^2\cdot 4$$ = 393,216. Plugging $$T=256, d=128, h=4$$ into the formula above gives 983,040 DMA clocks in total, so the score matrix alone is $$40\%$$ of our comms! And if we reduce our model even more to $$d=64$$ with prefill size $$512$$, that grows to nearly $$75\%$$.
 
-What if we could change our attention so that it doesn't write the attention score matrix $$S$$ at all? FlashAttention does exactly that. Since our transformer doesn't include softmax, we'll be modifying the original FlashAttention a bit, but the main idea stays the same.
+What if we could change our attention so that it doesn't write the attention score matrix $$P$$ at all? FlashAttention does exactly that. Since our transformer doesn't include softmax, we'll be modifying the original FlashAttention a bit, but the main idea stays the same.
 
 The main idea is to break down our $$Q,K,V$$ tensors into tiles of size $$[B,d_h]$$ for each head, so that the tiles fit in scratchpad. The outer loop goes through the $$Q$$ tiles, and the inner loop goes through $$K$$ tiles. In each loop, a $$[B, B]$$ tile of the attention scores is calculated, and then is multiplied by the corresponding $$V$$ tile. The result is accumulated over the outer loop. Here's the pseudocode for our FlashAttention algorithm:
 
@@ -276,7 +278,7 @@ for i in from 0 to T, with increment B:
         P_s = P_s + mask
         P_s = relu(P_s)
         tpu matmul(P_s, V_s, res_s, transpose=false, accumulate=(j > 0))
-       copy res_s to out[i +: B][:]
+    copy res_s to out[i +: B][:]
 ``` 
 
 ![FlashAttention data flow](/writeup/flash_attention.png)
@@ -288,7 +290,6 @@ Running our benchmark on FlashAttention, on the new architecture:
 ```
 run                                     2551133 clocks  212.594 ms @ 12 MHz
 MXU busy                                1226914   48.1%
-of which weight load                        0    0.0%
 VPU busy                                 339368   13.3%
 DMA busy                                 858464   33.7%
 no unit busy (issue overhead)            238305    9.3%
