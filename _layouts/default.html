@@ -1,9 +1,11 @@
-<!DOCTYPE html> <html lang="en">
+<!DOCTYPE html>
+<html lang="en">
 <head>
 {% include head.html %}
 <script>
+  // kramdown turns $$...$$ into MathJax's default \(...\) / \[...\]
+  // delimiters, so don't override them here.
   window.MathJax = {
-    tex: { inlineMath: [['$$', '$$']], displayMath: [['\\[', '\\]']] },
     options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] }
   };
 </script>
@@ -19,8 +21,6 @@
   }
   :root[data-theme="dark"] img { background: #fff; border-radius: 4px; }
 </style>
-<script src="https://polyfill.io"></script>
-<script id="MathJax-script" async src="https://jsdelivr.net"></script>
 </head>
 <body>
 {% include theme-toggle.html %}
