@@ -1,0 +1,50 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title | default: site.title }}</title>
+<script>
+  // Runs before first paint so the page never flashes the wrong theme.
+  (function () {
+    try {
+      var saved = localStorage.getItem('theme');
+      if (saved === 'light' || saved === 'dark') {
+        document.documentElement.setAttribute('data-theme', saved);
+      }
+    } catch (e) {}
+  })();
+</script>
+<style>
+  :root {
+    --bg: #fff; --fg: #1a1a1a; --muted: #666; --link: #0b5fff;
+    --rule: #eee; --border: #ddd; --code-bg: #f0f0f0; --pre-bg: #f6f6f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #15171a; --fg: #e3e4e6; --muted: #9aa0a6; --link: #6ea8ff;
+      --rule: #2a2e33; --border: #2f343a; --code-bg: #22262b; --pre-bg: #1c1f23;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #15171a; --fg: #e3e4e6; --muted: #9aa0a6; --link: #6ea8ff;
+    --rule: #2a2e33; --border: #2f343a; --code-bg: #22262b; --pre-bg: #1c1f23;
+  }
+
+  body { max-width: 46rem; margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+         font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+         color: var(--fg); background: var(--bg); }
+  h1, h2, h3 { line-height: 1.25; margin-top: 2em; }
+  img { max-width: 100%; display: block; margin: 1.5em auto; }
+  a { color: var(--link); }
+  pre { background: var(--pre-bg); padding: 1rem; overflow-x: auto; border-radius: 4px; }
+  code { font-size: 0.9em; }
+  pre code { background: none; padding: 0; }
+  :not(pre) > code { background: var(--code-bg); padding: 0.1em 0.3em; border-radius: 3px; }
+  table { border-collapse: collapse; width: 100%; overflow-x: auto; display: block; }
+  th, td { border: 1px solid var(--border); padding: 0.4rem 0.6rem; }
+  blockquote { border-left: 3px solid var(--border); margin-left: 0; padding-left: 1rem; color: var(--muted); }
+
+  #theme-toggle { position: fixed; top: 1rem; right: 1rem; z-index: 10;
+                  width: 2rem; height: 2rem; padding: 0; line-height: 1;
+                  font-size: 1rem; cursor: pointer; border-radius: 50%;
+                  border: 1px solid var(--border); background: var(--bg); color: var(--fg); }
+  #theme-toggle:hover { border-color: var(--link); }
+</style>

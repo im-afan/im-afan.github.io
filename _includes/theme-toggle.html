@@ -1,0 +1,24 @@
+<button id="theme-toggle" type="button" aria-label="Toggle dark mode" title="Toggle dark mode"></button>
+<script>
+  (function () {
+    var btn = document.getElementById('theme-toggle');
+    var root = document.documentElement;
+    var mq = window.matchMedia('(prefers-color-scheme: dark)');
+
+    function isDark() {
+      var set = root.getAttribute('data-theme');
+      return set ? set === 'dark' : mq.matches;
+    }
+    function render() { btn.textContent = isDark() ? '☀' : '☾'; }
+
+    btn.addEventListener('click', function () {
+      var next = isDark() ? 'light' : 'dark';
+      root.setAttribute('data-theme', next);
+      try { localStorage.setItem('theme', next); } catch (e) {}
+      render();
+    });
+    // Follow the OS while the visitor hasn't picked a theme themselves.
+    mq.addEventListener('change', render);
+    render();
+  })();
+</script>
